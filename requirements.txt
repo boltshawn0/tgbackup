@@ -1,0 +1,4 @@
+telethon
+aiofiles
+python-dotenv
+rclone
