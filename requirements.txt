@@ -1,4 +1,4 @@
-telethon
-aiofiles
-python-dotenv
-rclone
+telethon==1.34.0
+b2sdk==2.4.1
+qrcode==7.4.2
+pillow==10.4.0
