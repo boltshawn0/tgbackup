@@ -3,6 +3,7 @@ from pathlib import Path
 from datetime import datetime
 
 from telethon import TelegramClient
+from telethon.errors import SessionPasswordNeededError
 from telethon.tl.types import Message, MessageMediaDocument, MessageMediaPhoto
 
 # Backblaze B2 SDK
@@ -10,18 +11,19 @@ from b2sdk.v2 import InMemoryAccountInfo, B2Api
 from b2sdk.v2 import UploadSourceLocalFile
 from b2sdk.v2.exception import NonExistentBucket
 
-# Optional QR in logs
+# QR rendering (ASCII optional)
 import qrcode
 
 # ========= ENV =========
-API_ID        = int(os.environ["API_ID"])
-API_HASH      = os.environ["API_HASH"]
-PHONE_NUMBER  = os.environ["PHONE_NUMBER"]           # used after QR if needed
-CHANNEL_ID    = int(os.environ["CHANNEL_ID"])
-B2_KEY_ID     = os.environ["B2_KEY_ID"]
-B2_APP_KEY    = os.environ["B2_APP_KEY"]
-B2_BUCKET     = os.environ["B2_BUCKET"]
+API_ID          = int(os.environ["API_ID"])
+API_HASH        = os.environ["API_HASH"]
+PHONE_NUMBER    = os.environ["PHONE_NUMBER"]          # only used for fallback flows
+CHANNEL_ID      = int(os.environ["CHANNEL_ID"])
+B2_KEY_ID       = os.environ["B2_KEY_ID"]
+B2_APP_KEY      = os.environ["B2_APP_KEY"]
+B2_BUCKET       = os.environ["B2_BUCKET"]
 MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "4"))
+TWOFA_PASSWORD  = os.getenv("TELEGRAM_2FA_PASSWORD", "")  # optional: provide if you have 2FA enabled
 
 # ========= STATE (for resume) =========
 STATE_DIR = Path("./state")
@@ -31,8 +33,10 @@ SESSION_NAME  = str(STATE_DIR / "tg_backup_session")
 
 def load_manifest():
     if MANIFEST_PATH.exists():
-        try: return json.loads(MANIFEST_PATH.read_text())
-        except: pass
+        try:
+            return json.loads(MANIFEST_PATH.read_text())
+        except Exception:
+            pass
     return {"media_ids": []}
 
 def save_manifest(m):
@@ -51,21 +55,28 @@ def b2_connect():
     try:
         bucket = api.get_bucket_by_name(B2_BUCKET)
     except NonExistentBucket:
-        raise SystemExit(f"[FATAL] Bucket {B2_BUCKET} not found in this key scope.")
+        raise SystemExit(f"[FATAL] Bucket {B2_BUCKET} not found or not permitted for this key.")
     return api, bucket
 
 b2_api, b2_bucket = b2_connect()
 
 def b2_exists(remote_path: str) -> bool:
-    # remote_path like "tag/filename.ext"
-    # We'll check by listing that exact name
-    for f, _ in b2_bucket.ls(remote_path, show_versions=False, recursive=False):
-        if f.file_name == remote_path:
+    """
+    Portable existence check across b2sdk versions:
+    List by directory prefix and compare exact file_name.
+    remote_path like "tag/filename"
+    """
+    import os as _os
+    dir_name = _os.path.dirname(remote_path)
+    if dir_name and not dir_name.endswith('/'):
+        dir_name += '/'
+    # List everything under the directory; check for exact match
+    for file_version, _ in b2_bucket.ls(dir_name, recursive=True):
+        if file_version.file_name == remote_path:
             return True
     return False
 
 def b2_upload(local_path: Path, remote_path: str):
-    # remote_path = "<tag>/<filename>"
     src = UploadSourceLocalFile(str(local_path))
     b2_bucket.upload(src, remote_path)
 
@@ -87,24 +98,54 @@ def media_unique_id(m: Message) -> str | None:
         return f"pho_{m.photo.id}"
     return None
 
-# ========= QR login (no interactive typing) =========
+# ========= QR login (auto-refresh until approved; optional 2FA password) =========
 async def ensure_logged_in(client: TelegramClient):
     if await client.is_user_authorized():
+        print(">> Already authorized.")
         return
-    print(">> Not authorized. Showing Telegram QR in logs. Open your Telegram app → Settings → Devices → Scan QR")
-    qr_login = await client.qr_login()
-    try:
-        # Render QR to terminal as ASCII
-        img = qrcode.make(qr_login.url)
-        buf = io.StringIO()
-        img.print_ascii(out=buf)  # type: ignore
-        print(buf.getvalue())
-    except Exception:
-        # fallback: just print the URL (you can convert to QR on your phone)
-        print("QR URL:", qr_login.url)
 
-    await qr_login.wait()  # wait until you scan and approve
-    print(">> Authorized successfully via QR.")
+    print(">> Not authorized. I will keep refreshing the QR login until you scan it.")
+    while True:
+        qr_login = await client.qr_login()
+
+        # Try to render ASCII QR (optional). If it fails, we still print the URL.
+        try:
+            img = qrcode.make(qr_login.url)
+            buf = io.StringIO()
+            img.print_ascii(out=buf)  # type: ignore
+            print(buf.getvalue())
+        except Exception:
+            pass
+
+        print("QR URL:", qr_login.url)
+        print("Open on phone: Telegram → Settings → Devices → Link Desktop Device → Scan QR Code (scan within ~60s)")
+
+        try:
+            # Token is ~60s; wait slightly less so we can refresh
+            await asyncio.wait_for(qr_login.wait(), timeout=55)
+        except asyncio.TimeoutError:
+            print(">> QR expired. Generating a new one…")
+            continue
+
+        # If 2FA is enabled, Telethon may still require the password here.
+        try:
+            if not await client.is_user_authorized():
+                if TWOFA_PASSWORD:
+                    try:
+                        await client.sign_in(password=TWOFA_PASSWORD)
+                    except SessionPasswordNeededError:
+                        # Rare case: explicitly required password; we just tried it
+                        raise
+                # Re-check
+                if not await client.is_user_authorized():
+                    print(">> Login still incomplete (2FA likely). Set TELEGRAM_2FA_PASSWORD env var or disable 2FA temporarily.")
+                    continue
+        except SessionPasswordNeededError:
+            print(">> 2FA password required but TELEGRAM_2FA_PASSWORD not set. Add it to env and redeploy, or disable 2FA temporarily.")
+            continue
+
+        print(">> Authorized successfully via QR.")
+        return
 
 # ========= Download logic =========
 SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENCY)
@@ -115,7 +156,7 @@ async def download_one(client: TelegramClient, m: Message):
 
     uid = media_unique_id(m)
     if uid and uid in seen_ids:
-        return
+        return  # already done by ID
 
     tag = first_tag(m.message if m.message else "")
     ts  = m.date.strftime("%Y%m%d_%H%M%S")
@@ -132,6 +173,8 @@ async def download_one(client: TelegramClient, m: Message):
         base += "_" + safe_name(fname_hint)
 
     remote_path = f"{tag}/{base}"
+
+    # Duplicate check by remote existence too
     if b2_exists(remote_path):
         if uid: seen_ids.add(uid)
         return
@@ -139,7 +182,7 @@ async def download_one(client: TelegramClient, m: Message):
     async with SEMAPHORE:
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td) / base
-            # no size cap: allow >1.5GB
+            # No size cap: allow >1.5GB; retry logic for robustness
             for attempt in range(5):
                 try:
                     await client.download_media(m, file=str(tmp))
@@ -157,6 +200,7 @@ async def download_one(client: TelegramClient, m: Message):
                 print(f"[error] b2 upload failed for {remote_path}: {e}")
                 return
 
+    # Mark as done
     if uid:
         seen_ids.add(uid)
     manifest["media_ids"] = list(seen_ids)
@@ -176,7 +220,8 @@ async def main():
         batch = await client.get_messages(CHANNEL_ID, limit=LIMIT, offset_id=offset_id)
         if not batch:
             break
-        for m in reversed(batch):     # oldest → newest
+        # process oldest -> newest
+        for m in reversed(batch):
             await download_one(client, m)
             total += 1
             if total % 50 == 0:
