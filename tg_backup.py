@@ -22,7 +22,7 @@ CHANNEL_ID      = int(os.environ["CHANNEL_ID"])
 B2_KEY_ID       = os.environ["B2_KEY_ID"]
 B2_APP_KEY      = os.environ["B2_APP_KEY"]
 B2_BUCKET       = os.environ["B2_BUCKET"]
-MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "10"))
+MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "4"))
 TWOFA_PASSWORD  = os.getenv("TELEGRAM_2FA_PASSWORD", "")  # optional: provide if you have 2FA enabled
 
 # ========= STATE (for resume) =========
@@ -70,7 +70,6 @@ def b2_exists(remote_path: str) -> bool:
     dir_name = _os.path.dirname(remote_path)
     if dir_name and not dir_name.endswith('/'):
         dir_name += '/'
-    # List everything under the directory; check for exact match
     for file_version, _ in b2_bucket.ls(dir_name, recursive=True):
         if file_version.file_name == remote_path:
             return True
@@ -84,7 +83,7 @@ def b2_upload(local_path: Path, remote_path: str):
 HASHTAG_RE = re.compile(r"#([A-Za-z0-9_]+)")
 
 def first_tag(text: str | None) -> str | None:
-    if not text: 
+    if not text:
         return None
     m = HASHTAG_RE.search(text)
     return m.group(1) if m else None
@@ -146,7 +145,6 @@ async def ensure_logged_in(client: TelegramClient):
                         await client.sign_in(password=TWOFA_PASSWORD)
                     except SessionPasswordNeededError:
                         raise
-                # Re-check
                 if not await client.is_user_authorized():
                     print(">> Login still incomplete (2FA likely). Set TELEGRAM_2FA_PASSWORD env var or disable 2FA temporarily.")
                     continue
@@ -185,18 +183,28 @@ async def download_one(client: TelegramClient, m: Message, tag_mem: TagMemory):
 
     remote_path = f"{tag}/{base}"
 
-    # Duplicate check by remote existence too
+    # Duplicate check by remote existence too (optional; comment out for max speed)
     if b2_exists(remote_path):
-        if uid: seen_ids.add(uid)
+        if uid:
+            seen_ids.add(uid)
         return
 
     async with SEMAPHORE:
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td) / base
+
+            # 🔁 REFRESH EXPIRED FILE REFERENCES BEFORE DOWNLOADING
+            # (Fix for "file reference has expired" / GetFileRequest errors)
+            try:
+                refreshed = await client.get_messages(CHANNEL_ID, ids=m.id)
+                target_msg = refreshed or m
+            except Exception:
+                target_msg = m
+
             # No size cap: allow >1.5GB; retry logic for robustness
             for attempt in range(5):
                 try:
-                    await client.download_media(m, file=str(tmp))
+                    await client.download_media(target_msg, file=str(tmp))
                     break
                 except Exception as e:
                     print(f"[warn] retry {attempt+1} on msg {m.id}: {e}")
@@ -222,22 +230,23 @@ async def main():
     await client.connect()
     await ensure_logged_in(client)
 
-    LIMIT = 200
+    LIMIT = 200   # you can raise to 500 for fewer API calls
     offset_id = 0
     total = 0
-    tag_mem = TagMemory()  # remember last seen hashtag across messages
+    tag_mem = TagMemory()
     print(">> Starting backup…")
 
     while True:
         batch = await client.get_messages(CHANNEL_ID, limit=LIMIT, offset_id=offset_id)
         if not batch:
             break
-        # process oldest -> newest
+        # Oldest → newest within each batch
         for m in reversed(batch):
             await download_one(client, m, tag_mem)
             total += 1
             if total % 50 == 0:
                 print(f">> Processed {total} messages…")
+        # Advance paging
         offset_id = batch[-1].id
 
     await client.disconnect()
