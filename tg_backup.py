@@ -22,7 +22,7 @@ CHANNEL_ID      = int(os.environ["CHANNEL_ID"])
 B2_KEY_ID       = os.environ["B2_KEY_ID"]
 B2_APP_KEY      = os.environ["B2_APP_KEY"]
 B2_BUCKET       = os.environ["B2_BUCKET"]
-MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "4"))
+MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "12"))
 TWOFA_PASSWORD  = os.getenv("TELEGRAM_2FA_PASSWORD", "")  # optional: provide if you have 2FA enabled
 
 # ========= STATE (for resume) =========
