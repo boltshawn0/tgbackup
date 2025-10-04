@@ -80,13 +80,14 @@ def b2_upload(local_path: Path, remote_path: str):
     src = UploadSourceLocalFile(str(local_path))
     b2_bucket.upload(src, remote_path)
 
-# ========= Helpers =========
+# ========= Hashtag helpers + memory =========
 HASHTAG_RE = re.compile(r"#([A-Za-z0-9_]+)")
 
-def first_tag(text: str | None) -> str:
-    if not text: return "_no_tag"
+def first_tag(text: str | None) -> str | None:
+    if not text: 
+        return None
     m = HASHTAG_RE.search(text)
-    return m.group(1) if m else "_no_tag"
+    return m.group(1) if m else None
 
 def safe_name(s: str) -> str:
     return re.sub(r"[^\w\-. ]", "_", s)[:200]
@@ -97,6 +98,16 @@ def media_unique_id(m: Message) -> str | None:
     if isinstance(m.media, MessageMediaPhoto) and m.photo:
         return f"pho_{m.photo.id}"
     return None
+
+class TagMemory:
+    """Carry forward the last seen hashtag for subsequent untagged messages."""
+    def __init__(self):
+        self.current = "_no_tag"
+    def pick(self, caption: str | None) -> str:
+        t = first_tag(caption or "")
+        if t:
+            self.current = t
+        return self.current
 
 # ========= QR login (auto-refresh until approved; optional 2FA password) =========
 async def ensure_logged_in(client: TelegramClient):
@@ -134,7 +145,6 @@ async def ensure_logged_in(client: TelegramClient):
                     try:
                         await client.sign_in(password=TWOFA_PASSWORD)
                     except SessionPasswordNeededError:
-                        # Rare case: explicitly required password; we just tried it
                         raise
                 # Re-check
                 if not await client.is_user_authorized():
@@ -150,7 +160,7 @@ async def ensure_logged_in(client: TelegramClient):
 # ========= Download logic =========
 SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENCY)
 
-async def download_one(client: TelegramClient, m: Message):
+async def download_one(client: TelegramClient, m: Message, tag_mem: TagMemory):
     if not m or not m.media:
         return
 
@@ -158,7 +168,8 @@ async def download_one(client: TelegramClient, m: Message):
     if uid and uid in seen_ids:
         return  # already done by ID
 
-    tag = first_tag(m.message if m.message else "")
+    caption = m.message if m.message else ""
+    tag = tag_mem.pick(caption)  # <- carry forward last seen hashtag
     ts  = m.date.strftime("%Y%m%d_%H%M%S")
     base = f"{ts}_msg{m.id}"
 
@@ -214,6 +225,7 @@ async def main():
     LIMIT = 200
     offset_id = 0
     total = 0
+    tag_mem = TagMemory()  # remember last seen hashtag across messages
     print(">> Starting backup…")
 
     while True:
@@ -222,7 +234,7 @@ async def main():
             break
         # process oldest -> newest
         for m in reversed(batch):
-            await download_one(client, m)
+            await download_one(client, m, tag_mem)
             total += 1
             if total % 50 == 0:
                 print(f">> Processed {total} messages…")
