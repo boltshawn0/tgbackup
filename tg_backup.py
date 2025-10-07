@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import os, re, json, asyncio, tempfile, io, time, traceback
 from pathlib import Path
 
@@ -15,18 +16,19 @@ import qrcode
 # ========= ENV =========
 API_ID          = int(os.environ["API_ID"])
 API_HASH        = os.environ["API_HASH"]
-PHONE_NUMBER    = os.environ["PHONE_NUMBER"]             # not used interactively, kept for completeness
+PHONE_NUMBER    = os.environ.get("PHONE_NUMBER", "")           # not used interactively; kept for completeness
 CHANNEL_ID      = int(os.environ["CHANNEL_ID"])
 B2_KEY_ID       = os.environ["B2_KEY_ID"]
 B2_APP_KEY      = os.environ["B2_APP_KEY"]
 B2_BUCKET       = os.environ["B2_BUCKET"]
 MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "4"))
-TWOFA_PASSWORD  = os.getenv("TELEGRAM_2FA_PASSWORD", "") # optional
+TWOFA_PASSWORD  = os.getenv("TELEGRAM_2FA_PASSWORD", "")      # optional
+DISABLE_B2_EXISTS = os.getenv("DISABLE_B2_EXISTS", "0") in ("1","true","True","YES","yes")
 
 # ========= STATE (resume) =========
 STATE_DIR = Path("./state"); STATE_DIR.mkdir(parents=True, exist_ok=True)
 MANIFEST_PATH = STATE_DIR / "manifest.json"
-SESSION_NAME  = str(STATE_DIR / "tg_backup_session")
+SESSION_NAME  = str(STATE_DIR / "tg_backup_session")  # -> file at ./state/tg_backup_session.session
 
 def load_manifest():
     if MANIFEST_PATH.exists():
@@ -60,9 +62,11 @@ b2_api, b2_bucket = b2_connect()
 def b2_exists(remote_path: str) -> bool:
     """
     Portable existence check across b2sdk versions:
-    List by directory prefix and compare exact file_name.
+    list the directory prefix and compare exact file_name.
     remote_path like "tag/filename.ext"
     """
+    if DISABLE_B2_EXISTS:
+        return False
     import os as _os
     dir_name = _os.path.dirname(remote_path)
     if dir_name and not dir_name.endswith('/'):
@@ -106,9 +110,11 @@ class TagMemory:
 
 # ========= QR login (auto-refresh; optional 2FA) =========
 async def ensure_logged_in(client: TelegramClient):
+    # If a valid session already exists (e.g., you copied the .session in ./state), use it.
     if await client.is_user_authorized():
-        print(">> Already authorized.")
+        print(">> Already authorized (existing session).")
         return
+
     print(">> Not authorized. I will keep refreshing the QR login until you scan it.")
     while True:
         qr_login = await client.qr_login()
@@ -121,6 +127,7 @@ async def ensure_logged_in(client: TelegramClient):
         print("QR URL:", qr_login.url)
         print("Open on phone: Telegram → Settings → Devices → Link Desktop Device → Scan QR Code (scan within ~60s)")
         try:
+            # Token is ~60s; wait slightly less so we can refresh
             await asyncio.wait_for(qr_login.wait(), timeout=55)
         except asyncio.TimeoutError:
             print(">> QR expired. Generating a new one…")
@@ -160,7 +167,7 @@ async def download_one(client: TelegramClient, m: Message, tag_mem: TagMemory):
     ts  = m.date.strftime("%Y%m%d_%H%M%S")
     base = f"{ts}_msg{m.id}"
 
-    # filename hint (optional, we ultimately use Telethon's returned path)
+    # filename hint (optional; final name comes from Telethon's saved file)
     fname_hint = None
     if isinstance(m.media, MessageMediaDocument) and m.media.document:
         for a in m.media.document.attributes:
@@ -200,7 +207,7 @@ async def download_one(client: TelegramClient, m: Message, tag_mem: TagMemory):
             # Final remote path uses the *real* filename with extension
             remote_path = f"{tag}/{safe_name(local_path.name)}"
 
-            # Optional: remote existence check (comment out for maximum speed)
+            # Optional: remote existence check
             if b2_exists(remote_path):
                 if uid:
                     seen_ids.add(uid)
@@ -219,6 +226,7 @@ async def download_one(client: TelegramClient, m: Message, tag_mem: TagMemory):
     save_manifest(manifest)
 
 async def main():
+    # Use a session file under ./state so restarts reuse it
     client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
     await client.connect()
     await ensure_logged_in(client)
