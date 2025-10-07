@@ -1,33 +1,30 @@
 import os, re, json, asyncio, tempfile, io, time, traceback
 from pathlib import Path
-from datetime import datetime
 
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError
 from telethon.tl.types import Message, MessageMediaDocument, MessageMediaPhoto
 
 # Backblaze B2 SDK
-from b2sdk.v2 import InMemoryAccountInfo, B2Api
-from b2sdk.v2 import UploadSourceLocalFile
+from b2sdk.v2 import InMemoryAccountInfo, B2Api, UploadSourceLocalFile
 from b2sdk.v2.exception import NonExistentBucket
 
-# QR rendering (ASCII optional)
+# QR
 import qrcode
 
 # ========= ENV =========
 API_ID          = int(os.environ["API_ID"])
 API_HASH        = os.environ["API_HASH"]
-PHONE_NUMBER    = os.environ["PHONE_NUMBER"]          # only used for fallback flows
+PHONE_NUMBER    = os.environ["PHONE_NUMBER"]             # not used interactively, kept for completeness
 CHANNEL_ID      = int(os.environ["CHANNEL_ID"])
 B2_KEY_ID       = os.environ["B2_KEY_ID"]
 B2_APP_KEY      = os.environ["B2_APP_KEY"]
 B2_BUCKET       = os.environ["B2_BUCKET"]
 MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "4"))
-TWOFA_PASSWORD  = os.getenv("TELEGRAM_2FA_PASSWORD", "")  # optional: provide if you have 2FA enabled
+TWOFA_PASSWORD  = os.getenv("TELEGRAM_2FA_PASSWORD", "") # optional
 
-# ========= STATE (for resume) =========
-STATE_DIR = Path("./state")
-STATE_DIR.mkdir(parents=True, exist_ok=True)
+# ========= STATE (resume) =========
+STATE_DIR = Path("./state"); STATE_DIR.mkdir(parents=True, exist_ok=True)
 MANIFEST_PATH = STATE_DIR / "manifest.json"
 SESSION_NAME  = str(STATE_DIR / "tg_backup_session")
 
@@ -64,7 +61,7 @@ def b2_exists(remote_path: str) -> bool:
     """
     Portable existence check across b2sdk versions:
     List by directory prefix and compare exact file_name.
-    remote_path like "tag/filename"
+    remote_path like "tag/filename.ext"
     """
     import os as _os
     dir_name = _os.path.dirname(remote_path)
@@ -79,12 +76,11 @@ def b2_upload(local_path: Path, remote_path: str):
     src = UploadSourceLocalFile(str(local_path))
     b2_bucket.upload(src, remote_path)
 
-# ========= Hashtag helpers + memory =========
+# ========= Hashtags / names =========
 HASHTAG_RE = re.compile(r"#([A-Za-z0-9_]+)")
 
 def first_tag(text: str | None) -> str | None:
-    if not text:
-        return None
+    if not text: return None
     m = HASHTAG_RE.search(text)
     return m.group(1) if m else None
 
@@ -108,36 +104,29 @@ class TagMemory:
             self.current = t
         return self.current
 
-# ========= QR login (auto-refresh until approved; optional 2FA password) =========
+# ========= QR login (auto-refresh; optional 2FA) =========
 async def ensure_logged_in(client: TelegramClient):
     if await client.is_user_authorized():
         print(">> Already authorized.")
         return
-
     print(">> Not authorized. I will keep refreshing the QR login until you scan it.")
     while True:
         qr_login = await client.qr_login()
-
-        # Render ASCII QR (optional). If it fails, still print the URL.
         try:
             img = qrcode.make(qr_login.url)
-            buf = io.StringIO()
-            img.print_ascii(out=buf)  # type: ignore
+            buf = io.StringIO(); img.print_ascii(out=buf)  # type: ignore
             print(buf.getvalue())
         except Exception:
             pass
-
         print("QR URL:", qr_login.url)
         print("Open on phone: Telegram → Settings → Devices → Link Desktop Device → Scan QR Code (scan within ~60s)")
-
         try:
-            # Token is ~60s; wait slightly less so we can refresh
             await asyncio.wait_for(qr_login.wait(), timeout=55)
         except asyncio.TimeoutError:
             print(">> QR expired. Generating a new one…")
             continue
 
-        # If 2FA is enabled, Telethon may still require the password here.
+        # Handle 2FA if needed
         try:
             if not await client.is_user_authorized():
                 if TWOFA_PASSWORD:
@@ -146,10 +135,10 @@ async def ensure_logged_in(client: TelegramClient):
                     except SessionPasswordNeededError:
                         raise
                 if not await client.is_user_authorized():
-                    print(">> Login still incomplete (2FA likely). Set TELEGRAM_2FA_PASSWORD env var or disable 2FA temporarily.")
+                    print(">> Login still incomplete (2FA likely). Set TELEGRAM_2FA_PASSWORD or disable 2FA temporarily.")
                     continue
         except SessionPasswordNeededError:
-            print(">> 2FA password required but TELEGRAM_2FA_PASSWORD not set. Add it to env and redeploy, or disable 2FA temporarily.")
+            print(">> 2FA password required but TELEGRAM_2FA_PASSWORD not set. Add it and redeploy, or disable 2FA temporarily.")
             continue
 
         print(">> Authorized successfully via QR.")
@@ -171,27 +160,17 @@ async def download_one(client: TelegramClient, m: Message, tag_mem: TagMemory):
     ts  = m.date.strftime("%Y%m%d_%H%M%S")
     base = f"{ts}_msg{m.id}"
 
-    # original filename hint
+    # filename hint (optional, we ultimately use Telethon's returned path)
     fname_hint = None
     if isinstance(m.media, MessageMediaDocument) and m.media.document:
         for a in m.media.document.attributes:
             if hasattr(a, "file_name"):
                 fname_hint = a.file_name
                 break
-    if fname_hint:
-        base += "_" + safe_name(fname_hint)
-
-    remote_path = f"{tag}/{base}"
-
-    # Optional: remote existence check (comment out for max speed)
-    if b2_exists(remote_path):
-        if uid:
-            seen_ids.add(uid)
-        return
 
     async with SEMAPHORE:
         with tempfile.TemporaryDirectory() as td:
-            tmp = Path(td) / base
+            tmp_stem = Path(td) / (base + ("_" + safe_name(fname_hint) if fname_hint else ""))
 
             # Refresh expired file reference before downloading
             try:
@@ -200,20 +179,35 @@ async def download_one(client: TelegramClient, m: Message, tag_mem: TagMemory):
             except Exception:
                 target_msg = m
 
-            # No size cap: allow >1.5GB; retry logic for robustness
+            # Download and capture the actual saved path (Telethon returns it)
+            saved_path = None
             for attempt in range(5):
                 try:
-                    await client.download_media(target_msg, file=str(tmp))
+                    saved_path = await client.download_media(target_msg, file=str(tmp_stem))
                     break
                 except Exception as e:
                     print(f"[warn] retry {attempt+1} on msg {m.id}: {e}")
                     await asyncio.sleep(2 + attempt * 2)
-            else:
+            if not saved_path:
                 print(f"[skip] failed to download msg {m.id}")
                 return
 
+            local_path = Path(saved_path)
+            if not local_path.exists() or local_path.is_dir():
+                print(f"[skip] download returned invalid path for msg {m.id}: {saved_path}")
+                return
+
+            # Final remote path uses the *real* filename with extension
+            remote_path = f"{tag}/{safe_name(local_path.name)}"
+
+            # Optional: remote existence check (comment out for maximum speed)
+            if b2_exists(remote_path):
+                if uid:
+                    seen_ids.add(uid)
+                return
+
             try:
-                b2_upload(tmp, remote_path)
+                b2_upload(local_path, remote_path)
             except Exception as e:
                 print(f"[error] b2 upload failed for {remote_path}: {e}")
                 return
@@ -229,33 +223,35 @@ async def main():
     await client.connect()
     await ensure_logged_in(client)
 
-    LIMIT = 200   # you can raise to 500 for fewer API calls
+    LIMIT = 200     # can raise to 500
     total = 0
     tag_mem = TagMemory()
     print(">> Starting backup… (oldest → newest)")
     last_beat = time.time()
 
-    # ====== OLD → NEW traversal ======
-    # reverse=True returns ascending chronological order.
-    # We page forward by remembering the last seen id.
+    # OLD → NEW traversal (reverse=True = ascending chronological order)
     max_id = 0
     while True:
         batch = await client.get_messages(
             CHANNEL_ID,
             limit=LIMIT,
             offset_id=max_id,
-            reverse=True,   # <<< key: oldest → newest
+            reverse=True,   # key: oldest → newest
         )
         if not batch:
             break
 
         for m in batch:
-            await download_one(client, m, tag_mem)
+            try:
+                await download_one(client, m, tag_mem)
+            except Exception as e:
+                print(f"[error] unhandled during msg {m.id}: {e}")
+                traceback.print_exc()
             total += 1
             if total % 50 == 0:
                 print(f">> Processed {total} messages…")
 
-        # Move the window forward
+        # Advance window forward
         max_id = batch[-1].id
 
         # Heartbeat every ~10s
