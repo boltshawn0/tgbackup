@@ -1,4 +1,4 @@
-import os, re, json, asyncio, tempfile, io
+import os, re, json, asyncio, tempfile, io, time, traceback
 from pathlib import Path
 from datetime import datetime
 
@@ -118,7 +118,7 @@ async def ensure_logged_in(client: TelegramClient):
     while True:
         qr_login = await client.qr_login()
 
-        # Try to render ASCII QR (optional). If it fails, we still print the URL.
+        # Render ASCII QR (optional). If it fails, still print the URL.
         try:
             img = qrcode.make(qr_login.url)
             buf = io.StringIO()
@@ -167,7 +167,7 @@ async def download_one(client: TelegramClient, m: Message, tag_mem: TagMemory):
         return  # already done by ID
 
     caption = m.message if m.message else ""
-    tag = tag_mem.pick(caption)  # <- carry forward last seen hashtag
+    tag = tag_mem.pick(caption)  # carry forward last seen hashtag
     ts  = m.date.strftime("%Y%m%d_%H%M%S")
     base = f"{ts}_msg{m.id}"
 
@@ -183,7 +183,7 @@ async def download_one(client: TelegramClient, m: Message, tag_mem: TagMemory):
 
     remote_path = f"{tag}/{base}"
 
-    # Duplicate check by remote existence too (optional; comment out for max speed)
+    # Optional: remote existence check (comment out for max speed)
     if b2_exists(remote_path):
         if uid:
             seen_ids.add(uid)
@@ -193,8 +193,7 @@ async def download_one(client: TelegramClient, m: Message, tag_mem: TagMemory):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td) / base
 
-            # 🔁 REFRESH EXPIRED FILE REFERENCES BEFORE DOWNLOADING
-            # (Fix for "file reference has expired" / GetFileRequest errors)
+            # Refresh expired file reference before downloading
             try:
                 refreshed = await client.get_messages(CHANNEL_ID, ids=m.id)
                 target_msg = refreshed or m
@@ -231,23 +230,38 @@ async def main():
     await ensure_logged_in(client)
 
     LIMIT = 200   # you can raise to 500 for fewer API calls
-    offset_id = 0
     total = 0
     tag_mem = TagMemory()
-    print(">> Starting backup…")
+    print(">> Starting backup… (oldest → newest)")
+    last_beat = time.time()
 
+    # ====== OLD → NEW traversal ======
+    # reverse=True returns ascending chronological order.
+    # We page forward by remembering the last seen id.
+    max_id = 0
     while True:
-        batch = await client.get_messages(CHANNEL_ID, limit=LIMIT, offset_id=offset_id)
+        batch = await client.get_messages(
+            CHANNEL_ID,
+            limit=LIMIT,
+            offset_id=max_id,
+            reverse=True,   # <<< key: oldest → newest
+        )
         if not batch:
             break
-        # Oldest → newest within each batch
-        for m in reversed(batch):
+
+        for m in batch:
             await download_one(client, m, tag_mem)
             total += 1
             if total % 50 == 0:
                 print(f">> Processed {total} messages…")
-        # Advance paging
-        offset_id = batch[-1].id
+
+        # Move the window forward
+        max_id = batch[-1].id
+
+        # Heartbeat every ~10s
+        if time.time() - last_beat > 10:
+            print(f">> Heartbeat: total={total}, last_id={max_id}, time={time.strftime('%H:%M:%S')}")
+            last_beat = time.time()
 
     await client.disconnect()
     print(">> Done. Manifest saved.")
