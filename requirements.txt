@@ -1,4 +1,4 @@
-telethon==1.34.0
-b2sdk==2.4.1
+telethon==1.36.0
+b2sdk==2.5.0
 qrcode==7.4.2
-pillow==10.4.0
+Pillow==10.3.0
