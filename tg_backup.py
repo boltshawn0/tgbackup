@@ -1,14 +1,22 @@
 #!/usr/bin/env python3
 import os, re, json, asyncio, tempfile, io, time, traceback
 from pathlib import Path
+
 from telethon import TelegramClient
-from telethon.tl.types import Message, MessageMediaDocument, MessageMediaPhoto
 from telethon.errors import SessionPasswordNeededError
-from b2sdk.v2 import InMemoryAccountInfo, B2Api, UploadSourceLocalFile, NonExistentBucket
+from telethon.tl.types import Message, MessageMediaDocument, MessageMediaPhoto
+
+# ✅ Corrected B2 SDK imports
+from b2sdk.v2 import InMemoryAccountInfo, B2Api, UploadSourceLocalFile
+from b2sdk.v2.exception import NonExistentBucket
+
+# QR
+import qrcode
 
 # ========= ENV =========
 API_ID          = int(os.environ["API_ID"])
 API_HASH        = os.environ["API_HASH"]
+PHONE_NUMBER    = os.environ.get("PHONE_NUMBER", "")
 CHANNEL_ID      = int(os.environ["CHANNEL_ID"])
 B2_KEY_ID       = os.environ["B2_KEY_ID"]
 B2_APP_KEY      = os.environ["B2_APP_KEY"]
@@ -17,9 +25,8 @@ MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "4"))
 TWOFA_PASSWORD  = os.getenv("TELEGRAM_2FA_PASSWORD", "")
 DISABLE_B2_EXISTS = os.getenv("DISABLE_B2_EXISTS", "0") in ("1","true","True","YES","yes")
 
-# ========= STATE =========
-STATE_DIR = Path("./state")
-STATE_DIR.mkdir(parents=True, exist_ok=True)
+# ========= STATE (resume) =========
+STATE_DIR = Path("./state"); STATE_DIR.mkdir(parents=True, exist_ok=True)
 MANIFEST_PATH = STATE_DIR / "manifest.json"
 SESSION_NAME  = str(STATE_DIR / "tg_backup_session")
 
@@ -47,12 +54,13 @@ def b2_connect():
     try:
         bucket = api.get_bucket_by_name(B2_BUCKET)
     except NonExistentBucket:
-        raise SystemExit(f"[FATAL] Bucket {B2_BUCKET} not found or not permitted.")
+        raise SystemExit(f"[FATAL] Bucket {B2_BUCKET} not found or not permitted for this key.")
     return api, bucket
 
 b2_api, b2_bucket = b2_connect()
 
 def b2_exists(remote_path: str) -> bool:
+    """Check if a file already exists on B2."""
     if DISABLE_B2_EXISTS:
         return False
     import os as _os
@@ -68,12 +76,11 @@ def b2_upload(local_path: Path, remote_path: str):
     src = UploadSourceLocalFile(str(local_path))
     b2_bucket.upload(src, remote_path)
 
-# ========= Hashtag handling =========
+# ========= Hashtags / names =========
 HASHTAG_RE = re.compile(r"#([A-Za-z0-9_]+)")
 
 def first_tag(text: str | None) -> str | None:
-    if not text:
-        return None
+    if not text: return None
     m = HASHTAG_RE.search(text)
     return m.group(1) if m else None
 
@@ -88,6 +95,7 @@ def media_unique_id(m: Message) -> str | None:
     return None
 
 class TagMemory:
+    """Carry forward the last seen hashtag for subsequent untagged messages."""
     def __init__(self):
         self.current = "_no_tag"
     def pick(self, caption: str | None) -> str:
@@ -95,6 +103,43 @@ class TagMemory:
         if t:
             self.current = t
         return self.current
+
+# ========= Login =========
+async def ensure_logged_in(client: TelegramClient):
+    if await client.is_user_authorized():
+        print(">> Already authorized (existing session).")
+        return
+
+    print(">> Not authorized. Please scan the QR or sign in manually.")
+    while True:
+        qr_login = await client.qr_login()
+        try:
+            img = qrcode.make(qr_login.url)
+            buf = io.StringIO(); img.print_ascii(out=buf)
+            print(buf.getvalue())
+        except Exception:
+            pass
+        print("QR URL:", qr_login.url)
+        print("Scan it from Telegram → Settings → Devices → Link Desktop Device.")
+        try:
+            await asyncio.wait_for(qr_login.wait(), timeout=55)
+        except asyncio.TimeoutError:
+            print(">> QR expired, regenerating…")
+            continue
+
+        if not await client.is_user_authorized():
+            if TWOFA_PASSWORD:
+                try:
+                    await client.sign_in(password=TWOFA_PASSWORD)
+                except SessionPasswordNeededError:
+                    print(">> Wrong 2FA or missing password.")
+                    continue
+            else:
+                print(">> 2FA password required but not set.")
+                continue
+
+        print(">> Authorized successfully via QR.")
+        return
 
 # ========= Download logic =========
 SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENCY)
@@ -105,9 +150,9 @@ async def download_one(client: TelegramClient, m: Message, tag_mem: TagMemory):
 
     uid = media_unique_id(m)
     if uid and uid in seen_ids:
-        return
+        return  # already done
 
-    caption = m.message if m.message else ""
+    caption = m.message or ""
     tag = tag_mem.pick(caption)
     ts  = m.date.strftime("%Y%m%d_%H%M%S")
     base = f"{ts}_msg{m.id}"
@@ -122,6 +167,7 @@ async def download_one(client: TelegramClient, m: Message, tag_mem: TagMemory):
     async with SEMAPHORE:
         with tempfile.TemporaryDirectory() as td:
             tmp_stem = Path(td) / (base + ("_" + safe_name(fname_hint) if fname_hint else ""))
+
             try:
                 refreshed = await client.get_messages(CHANNEL_ID, ids=m.id)
                 target_msg = refreshed or m
@@ -142,14 +188,12 @@ async def download_one(client: TelegramClient, m: Message, tag_mem: TagMemory):
 
             local_path = Path(saved_path)
             if not local_path.exists() or local_path.is_dir():
-                print(f"[skip] invalid download for msg {m.id}")
+                print(f"[skip] invalid path for msg {m.id}: {saved_path}")
                 return
 
             remote_path = f"{tag}/{safe_name(local_path.name)}"
-
             if b2_exists(remote_path):
-                if uid:
-                    seen_ids.add(uid)
+                if uid: seen_ids.add(uid)
                 return
 
             try:
@@ -163,13 +207,10 @@ async def download_one(client: TelegramClient, m: Message, tag_mem: TagMemory):
     manifest["media_ids"] = list(seen_ids)
     save_manifest(manifest)
 
-# ========= Main =========
 async def main():
     client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
     await client.connect()
-    if not await client.is_user_authorized():
-        print("⚠️  Not authorized — you must create session via make_session_manual.py first.")
-        return
+    await ensure_logged_in(client)
 
     LIMIT = 200
     total = 0
@@ -179,7 +220,12 @@ async def main():
     max_id = 0
 
     while True:
-        batch = await client.get_messages(CHANNEL_ID, limit=LIMIT, offset_id=max_id, reverse=True)
+        batch = await client.get_messages(
+            CHANNEL_ID,
+            limit=LIMIT,
+            offset_id=max_id,
+            reverse=True,
+        )
         if not batch:
             break
 
@@ -187,7 +233,7 @@ async def main():
             try:
                 await download_one(client, m, tag_mem)
             except Exception as e:
-                print(f"[error] during msg {m.id}: {e}")
+                print(f"[error] unhandled during msg {m.id}: {e}")
                 traceback.print_exc()
             total += 1
             if total % 50 == 0:
