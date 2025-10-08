@@ -55,7 +55,17 @@ seen_ids = set(manifest.get("media_ids", []))
 
 # ========= Backblaze B2 =========
 from b2sdk.v2 import InMemoryAccountInfo, B2Api, UploadSourceLocalFile
-from b2sdk.exception import BucketNotFound  # correct import for current b2sdk
+
+# Handle import across b2sdk versions
+try:
+    from b2sdk.v2.exception import NonExistentBucket as BucketNotFound
+except ImportError:
+    try:
+        from b2sdk.exception import NonExistentBucket as BucketNotFound
+    except ImportError:
+        class BucketNotFound(Exception):
+            """Fallback dummy exception for b2sdk compatibility"""
+            pass
 
 def b2_connect():
     info = InMemoryAccountInfo()
