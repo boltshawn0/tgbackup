@@ -26,7 +26,7 @@ B2_KEY_ID       = os.environ["B2_KEY_ID"]
 B2_APP_KEY      = os.environ["B2_APP_KEY"]
 B2_BUCKET       = os.environ["B2_BUCKET"]
 
-MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "4"))
+MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "10"))
 TWOFA_PASSWORD  = os.getenv("TELEGRAM_2FA_PASSWORD", "")  # optional
 
 # NEW: gate processing until we hit this hashtag (no #, case-insensitive)
