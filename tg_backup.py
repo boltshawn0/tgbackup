@@ -3,6 +3,7 @@ import os, re, json, asyncio, tempfile, io, time, traceback
 from pathlib import Path
 
 from telethon import TelegramClient
+from telethon.errors import SessionPasswordNeededError
 from telethon.tl.types import Message, MessageMediaDocument, MessageMediaPhoto
 
 # 🔒 Force a stable Telegram device identity (helps avoid random logouts)
@@ -27,22 +28,7 @@ B2_BUCKET       = os.environ["B2_BUCKET"]
 
 MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "10"))
 TWOFA_PASSWORD  = os.getenv("TELEGRAM_2FA_PASSWORD", "")  # optional
-
-# Navigation controls
-# DIRECTION: "old2new" (oldest→newest) or "new2old" (newest→oldest)
-DIRECTION       = os.getenv("DIRECTION", "new2old").strip().lower()
-
-# Optional numeric bounds (message IDs)
-# - When DIRECTION=new2old: you can set START_FROM_ID (start at this id or below)
-#   and/or STOP_AT_ID (stop when m.id <= STOP_AT_ID).
-# - When DIRECTION=old2new: START_FROM_ID means "skip until m.id >= START_FROM_ID",
-#   STOP_AT_ID means "stop when m.id >= STOP_AT_ID".
-START_FROM_ID   = int(os.getenv("START_FROM_ID", "0") or 0)
-STOP_AT_ID      = int(os.getenv("STOP_AT_ID", "0") or 0)
-
-# Tag gates (no leading #; case-insensitive)
-START_FROM_TAG  = os.getenv("START_FROM_TAG", "").strip()
-STOP_AT_TAG     = os.getenv("STOP_AT_TAG", "").strip()
+START_FROM_TAG  = os.getenv("START_FROM_TAG", "").strip()  # e.g. "kaniiberry"
 
 # ========= STATE (resume) =========
 STATE_DIR = Path("./state"); STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -71,10 +57,10 @@ from b2sdk.v2 import InMemoryAccountInfo, B2Api, UploadSourceLocalFile
 # Handle import across b2sdk versions
 try:
     from b2sdk.v2.exception import NonExistentBucket as BucketNotFound
-except Exception:
+except ImportError:
     try:
         from b2sdk.exception import NonExistentBucket as BucketNotFound
-    except Exception:
+    except ImportError:
         class BucketNotFound(Exception):
             pass
 
@@ -104,9 +90,8 @@ def b2_upload(local_path: Path, remote_path: str):
     src = UploadSourceLocalFile(str(local_path))
     b2_bucket.upload(src, remote_path)
 
-# ========= Tag helpers =========
+# ========= Hashtags / tags =========
 HASHTAG_RE = re.compile(r"#([A-Za-z0-9_]+)")
-
 def all_tags(text: str | None) -> set[str]:
     if not text:
         return set()
@@ -219,88 +204,23 @@ async def download_one(client: TelegramClient, m: Message, tag_mem: TagMemory):
     manifest["media_ids"] = list(seen_ids)
     save_manifest(manifest)
 
-# ========= Iteration helpers (direction, bounds, tags) =========
-def should_stop_by_id(mid: int) -> bool:
-    if STOP_AT_ID <= 0:
-        return False
-    if DIRECTION == "new2old":
-        return mid <= STOP_AT_ID
-    else:  # old2new
-        return mid >= STOP_AT_ID
-
-def passed_start_id(mid: int) -> bool:
-    if START_FROM_ID <= 0:
-        return True
-    if DIRECTION == "new2old":
-        # When going newer→older, "start_from_id" means: don't start unless m.id <= START_FROM_ID
-        return mid <= START_FROM_ID
-    else:
-        # When going older→newer, start once m.id >= START_FROM_ID
-        return mid >= START_FROM_ID
-
+# ========= MAIN (NEW → OLD) =========
 async def main():
     client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
     await client.connect()
     await ensure_logged_in(client)
 
-    tag_mem = TagMemory()
     total = 0
+    tag_mem = TagMemory()
+    print(">> Starting backup… (newest → oldest)")
     last_beat = time.time()
 
-    # Build iterator: Telethon.iter_messages handles pagination for us.
-    # reverse=True  -> oldest → newest
-    # reverse=False -> newest → oldest
-    reverse = (DIRECTION == "old2new")
-
-    # We can set min_id / max_id to bound the generator a bit:
-    min_id = None
-    max_id = None
-    if DIRECTION == "old2new":
-        # If starting late, hint with min_id
-        if START_FROM_ID > 0:
-            min_id = START_FROM_ID
-    else:
-        # new2old: if you know a high starting id, set max_id so we don't fetch newer than that
-        if START_FROM_ID > 0:
-            max_id = START_FROM_ID
-
-    print(f">> Starting backup… direction={DIRECTION}  (reverse={reverse})")
-    if START_FROM_ID:
-        print(f">> START_FROM_ID={START_FROM_ID}")
-    if STOP_AT_ID:
-        print(f">> STOP_AT_ID={STOP_AT_ID}")
-    if START_FROM_TAG:
-        print(f">> Waiting for tag '#{START_FROM_TAG}' before downloading…")
-    if STOP_AT_TAG:
-        print(f">> Will stop when tag '#{STOP_AT_TAG}' is encountered.")
-
+    # Optional “start when we hit a tag” gate still works, but now we scan from newest → oldest.
     waiting_for_tag = bool(START_FROM_TAG)
     started_from = None
 
-    # Iterate messages as a stream
-    async for m in client.iter_messages(
-        CHANNEL_ID,
-        reverse=reverse,
-        limit=None,
-        min_id=min_id,
-        max_id=max_id,
-    ):
-        # Optional: print a heartbeat every ~10s
-        if time.time() - last_beat > 10:
-            hb = f">> Heartbeat: total={total}, last_id={m.id}, time={time.strftime('%H:%M:%S')}"
-            if started_from:
-                hb += f" (started_at={started_from})"
-            print(hb)
-            last_beat = time.time()
-
-        # Boundaries by ID
-        if not passed_start_id(m.id):
-            continue
-        if should_stop_by_id(m.id):
-            print(f">> Stop boundary reached at msg {m.id} (STOP_AT_ID={STOP_AT_ID}).")
-            break
-
-        # Start/stop by tag
+    # Use Telethon's iterator – reverse=False means newest → oldest.
+    async for m in client.iter_messages(CHANNEL_ID, reverse=False):
         if waiting_for_tag:
             if has_tag(m.message, START_FROM_TAG):
                 waiting_for_tag = False
@@ -308,18 +228,23 @@ async def main():
                 print(f">> Start tag '#{START_FROM_TAG}' found at msg {m.id} — beginning downloads")
             else:
                 continue
-        if STOP_AT_TAG and has_tag(m.message, STOP_AT_TAG):
-            print(f">> Stop tag '#{STOP_AT_TAG}' found at msg {m.id} — stopping.")
-            break
 
         try:
             await download_one(client, m, tag_mem)
         except Exception as e:
             print(f"[error] unhandled during msg {m.id}: {e}")
             traceback.print_exc()
+
         total += 1
-        if total and (total % 50 == 0):
+        if total % 50 == 0:
             print(f">> Processed {total} messages…")
+
+        if time.time() - last_beat > 10:
+            hb = f">> Heartbeat: total={total}, last_id={m.id}, time={time.strftime('%H:%M:%S')}"
+            if started_from:
+                hb += f" (started_at={started_from})"
+            print(hb)
+            last_beat = time.time()
 
     await client.disconnect()
     print(">> Done. Manifest saved.")
