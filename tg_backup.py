@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-import os, re, json, asyncio, tempfile, time, io, traceback
+import os, re, json, asyncio, tempfile, time, traceback
 from pathlib import Path
 
 from telethon import TelegramClient
 from telethon.tl.types import Message, MessageMediaDocument, MessageMediaPhoto
+from telethon.errors.common import TypeNotFoundError
 
 # ========= ENV =========
 API_ID          = int(os.environ["API_ID"])
@@ -14,10 +15,8 @@ B2_KEY_ID       = os.environ["B2_KEY_ID"]
 B2_APP_KEY      = os.environ["B2_APP_KEY"]
 B2_BUCKET       = os.environ["B2_BUCKET"]
 
-MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "10"))
-TWOFA_PASSWORD  = os.getenv("TELEGRAM_2FA_PASSWORD", "")        # optional (not used here)
-BACKUP_DIRECTION= os.getenv("BACKUP_DIRECTION", "new2old").lower().strip()  # "new2old" (default) or "old2new"
-START_FROM_TAG  = os.getenv("START_FROM_TAG", "").strip()        # optional gate, e.g. "kaniiberry" (no '#')
+MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "4"))
+DISABLE_B2_EXISTS = os.getenv("DISABLE_B2_EXISTS", "0") in ("1","true","True","YES","yes")
 
 # ========= STATE (resume) =========
 STATE_DIR = Path("./state"); STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -42,16 +41,16 @@ seen_ids = set(manifest.get("media_ids", []))
 
 # ========= Backblaze B2 =========
 from b2sdk.v2 import InMemoryAccountInfo, B2Api, UploadSourceLocalFile
-# Robust import for bucket-not-found across b2sdk versions
-BucketNotFound = None
+
+# Handle exception import across b2sdk versions
 try:
-    from b2sdk.v2.exception import NonExistentBucket as BucketNotFound  # older path
+    from b2sdk.v2.exception import NonExistentBucket as BucketNotFound
 except Exception:
     try:
-        from b2sdk.exception import NonExistentBucket as BucketNotFound  # other path
+        from b2sdk.exception import NonExistentBucket as BucketNotFound
     except Exception:
-        class _BNF(Exception): pass
-        BucketNotFound = _BNF
+        class BucketNotFound(Exception):
+            pass
 
 def b2_connect():
     info = InMemoryAccountInfo()
@@ -66,7 +65,8 @@ def b2_connect():
 b2_api, b2_bucket = b2_connect()
 
 def b2_exists(remote_path: str) -> bool:
-    """Check existence by listing the parent prefix; compatible with b2sdk 2.5.0."""
+    if DISABLE_B2_EXISTS:
+        return False
     import os as _os
     dir_name = _os.path.dirname(remote_path)
     if dir_name and not dir_name.endswith('/'):
@@ -89,16 +89,9 @@ def all_tags(text: str | None) -> set[str]:
     return {m.lower() for m in HASHTAG_RE.findall(text)}
 
 def first_tag(text: str | None) -> str | None:
-    if not text:
-        return None
+    if not text: return None
     m = HASHTAG_RE.search(text)
     return m.group(1) if m else None
-
-def has_tag(text: str | None, tag: str) -> bool:
-    if not tag:
-        return True
-    tag = tag.lower().lstrip("#")
-    return tag in all_tags(text)
 
 def safe_name(s: str) -> str:
     return re.sub(r"[^\w\-. ]", "_", s)[:200]
@@ -120,13 +113,23 @@ class TagMemory:
             self.current = t
         return self.current
 
-# ========= Ensure logged in (expects an existing session file) =========
+# ========= Session handling =========
 async def ensure_logged_in(client: TelegramClient):
     if await client.is_user_authorized():
         print(">> Already authorized (existing session).")
         return
-    print(">> Not authorized. Please log in once with the phone-code helper (make_session_phone.py).")
-    raise SystemExit("Session missing or invalid. Create ./state/tg_backup_session.session first.")
+    print(">> Not authorized. Please log in once with make_session_phone.py (phone code).")
+    raise SystemExit("Session missing or invalid. Run make_session_phone.py first.")
+
+async def reconnect(client: TelegramClient):
+    try:
+        await client.disconnect()
+    except Exception:
+        pass
+    await asyncio.sleep(5)
+    await client.connect()
+    if not await client.is_user_authorized():
+        raise SystemExit("Session lost; re-run make_session_phone.py")
 
 # ========= Download logic =========
 SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENCY)
@@ -155,6 +158,7 @@ async def download_one(client: TelegramClient, m: Message, tag_mem: TagMemory):
         with tempfile.TemporaryDirectory() as td:
             tmp_stem = Path(td) / (base + ("_" + safe_name(fname_hint) if fname_hint else ""))
 
+            # refresh the message handle (helps with grouped media)
             try:
                 refreshed = await client.get_messages(CHANNEL_ID, ids=m.id)
                 target_msg = refreshed or m
@@ -166,9 +170,19 @@ async def download_one(client: TelegramClient, m: Message, tag_mem: TagMemory):
                 try:
                     saved_path = await client.download_media(target_msg, file=str(tmp_stem))
                     break
+                except TypeNotFoundError as e:
+                    print(f"[warn] schema hiccup on msg {m.id} (attempt {attempt+1}/5): {e}. Reconnecting…")
+                    await reconnect(client)
+                    try:
+                        refreshed = await client.get_messages(CHANNEL_ID, ids=m.id)
+                        target_msg = refreshed or m
+                    except Exception:
+                        target_msg = m
+                    await asyncio.sleep(1 + attempt)
                 except Exception as e:
                     print(f"[warn] retry {attempt+1} on msg {m.id}: {e}")
                     await asyncio.sleep(2 + attempt * 2)
+
             if not saved_path:
                 print(f"[skip] failed to download msg {m.id}")
                 return
@@ -196,8 +210,8 @@ async def download_one(client: TelegramClient, m: Message, tag_mem: TagMemory):
     manifest["media_ids"] = list(seen_ids)
     save_manifest(manifest)
 
+# ========= Main (NEW → OLD) =========
 async def main():
-    # Use official client identity fields (no private monkey-patch)
     client = TelegramClient(
         SESSION_NAME,
         API_ID,
@@ -208,44 +222,48 @@ async def main():
         lang_code="en",
         system_lang_code="en",
         request_retries=5,
+        connection_retries=5,
         flood_sleep_threshold=60,
     )
     await client.connect()
     await ensure_logged_in(client)
 
-    LIMIT = None  # stream everything
-    total = 0
     tag_mem = TagMemory()
-
-    reverse = (BACKUP_DIRECTION == "old2new")
-    print(f">> Starting backup… direction={'old2new' if reverse else 'new2old'}  (reverse={reverse})")
+    total = 0
     last_beat = time.time()
 
-    waiting_for_tag = bool(START_FROM_TAG)
+    print(">> Starting backup… direction=new2old  (reverse=False)")
 
-    async for m in client.iter_messages(CHANNEL_ID, limit=LIMIT, reverse=reverse):
-        if waiting_for_tag:
-            if has_tag(getattr(m, "message", None), START_FROM_TAG):
-                waiting_for_tag = False
-                print(f">> Start tag '#{START_FROM_TAG}' found at msg {m.id} — beginning downloads")
-            else:
-                continue
+    # Iterate newest -> oldest. This avoids scanning through the first N ids.
+    # We only process messages that have media.
+    try:
+        async for m in client.iter_messages(
+            CHANNEL_ID,
+            limit=None,            # all
+            reverse=False,         # NEW -> OLD
+        ):
+            try:
+                await download_one(client, m, tag_mem)
+            except Exception as e:
+                print(f"[error] unhandled during msg {getattr(m,'id',None)}: {e}")
+                traceback.print_exc()
 
-        try:
-            await download_one(client, m, tag_mem)
-        except Exception as e:
-            print(f"[error] unhandled during msg {m.id}: {e}")
-            traceback.print_exc()
+            total += 1
+            if total % 50 == 0:
+                print(f">> Processed {total} messages…")
 
-        total += 1
-        if total % 50 == 0:
-            print(f">> Processed {total} messages…")
+            if time.time() - last_beat > 10:
+                print(f">> Heartbeat: total={total}, last_id={getattr(m,'id',None)}, time={time.strftime('%H:%M:%S')}")
+                last_beat = time.time()
 
-        if time.time() - last_beat > 10:
-            print(f">> Heartbeat: total={total}, last_id={m.id}, time={time.strftime('%H:%M:%S')}")
-            last_beat = time.time()
+    except TypeNotFoundError as e:
+        print(f"[warn] stream schema hiccup: {e}. Reconnecting and continuing…")
+        await reconnect(client)
+        # Let the process restart (Railway will usually restart on non-zero exit),
+        # or simply end here gracefully:
+    finally:
+        await client.disconnect()
 
-    await client.disconnect()
     print(">> Done. Manifest saved.")
 
 if __name__ == "__main__":
