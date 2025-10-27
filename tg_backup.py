@@ -4,19 +4,24 @@ from pathlib import Path
 
 from telethon import TelegramClient
 from telethon.tl.types import Message, MessageMediaDocument, MessageMediaPhoto
-from telethon.errors.common import TypeNotFoundError
 
 # ========= ENV =========
-API_ID          = int(os.environ["API_ID"])
-API_HASH        = os.environ["API_HASH"]
-CHANNEL_ID      = int(os.environ["CHANNEL_ID"])
+API_ID            = int(os.environ["API_ID"])
+API_HASH          = os.environ["API_HASH"]
+CHANNEL_ID        = int(os.environ["CHANNEL_ID"])
 
-B2_KEY_ID       = os.environ["B2_KEY_ID"]
-B2_APP_KEY      = os.environ["B2_APP_KEY"]
-B2_BUCKET       = os.environ["B2_BUCKET"]
+B2_KEY_ID         = os.environ["B2_KEY_ID"]
+B2_APP_KEY        = os.environ["B2_APP_KEY"]
+B2_BUCKET         = os.environ["B2_BUCKET"]
 
-MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "4"))
-DISABLE_B2_EXISTS = os.getenv("DISABLE_B2_EXISTS", "0") in ("1","true","True","YES","yes")
+# parallelism
+MAX_CONCURRENCY   = int(os.getenv("MAX_CONCURRENCY", "6"))      # per-file download concurrency guard
+MAX_INFLIGHT      = int(os.getenv("MAX_INFLIGHT", str(MAX_CONCURRENCY)))  # how many messages we work on at once
+
+# optional controls
+DISABLE_B2_EXISTS = os.getenv("DISABLE_B2_EXISTS", "0").lower() in ("1","true","yes")
+START_FROM_TAG    = os.getenv("START_FROM_TAG", "").strip()      # e.g. cinnanoe (no '#')
+START_FROM_MSG_ID = os.getenv("START_FROM_MSG_ID", "").strip()   # numeric string to override the tag
 
 # ========= STATE (resume) =========
 STATE_DIR = Path("./state"); STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -42,15 +47,18 @@ seen_ids = set(manifest.get("media_ids", []))
 # ========= Backblaze B2 =========
 from b2sdk.v2 import InMemoryAccountInfo, B2Api, UploadSourceLocalFile
 
-# Handle exception import across b2sdk versions
-try:
-    from b2sdk.v2.exception import NonExistentBucket as BucketNotFound
-except Exception:
+# Handle NonExistentBucket across b2sdk versions
+BucketNotFound = None
+for path in ("b2sdk.v2.exception", "b2sdk.exception"):
     try:
-        from b2sdk.exception import NonExistentBucket as BucketNotFound
+        mod = __import__(path, fromlist=["NonExistentBucket"])
+        BucketNotFound = getattr(mod, "NonExistentBucket")
+        break
     except Exception:
-        class BucketNotFound(Exception):
-            pass
+        pass
+if BucketNotFound is None:
+    class BucketNotFound(Exception):
+        pass
 
 def b2_connect():
     info = InMemoryAccountInfo()
@@ -80,7 +88,7 @@ def b2_upload(local_path: Path, remote_path: str):
     src = UploadSourceLocalFile(str(local_path))
     b2_bucket.upload(src, remote_path)
 
-# ========= Hashtags / tags =========
+# ========= Tags / filenames / ids =========
 HASHTAG_RE = re.compile(r"#([A-Za-z0-9_]+)")
 
 def all_tags(text: str | None) -> set[str]:
@@ -113,25 +121,43 @@ class TagMemory:
             self.current = t
         return self.current
 
-# ========= Session handling =========
+# ========= Login (expects an existing session file) =========
 async def ensure_logged_in(client: TelegramClient):
     if await client.is_user_authorized():
         print(">> Already authorized (existing session).")
         return
-    print(">> Not authorized. Please log in once with make_session_phone.py (phone code).")
-    raise SystemExit("Session missing or invalid. Run make_session_phone.py first.")
+    print(">> Not authorized. Please log in once with your phone-code script to create the session.")
+    raise SystemExit("Session missing or invalid.")
 
-async def reconnect(client: TelegramClient):
+# ========= Helper: find start point from tag / msg id =========
+async def resolve_start_from_tag_id(client: TelegramClient):
+    if not START_FROM_TAG:
+        return None
     try:
-        await client.disconnect()
-    except Exception:
-        pass
-    await asyncio.sleep(5)
-    await client.connect()
-    if not await client.is_user_authorized():
-        raise SystemExit("Session lost; re-run make_session_phone.py")
+        res = await client.get_messages(
+            CHANNEL_ID,
+            search=f"#{START_FROM_TAG}",
+            limit=1
+        )
+        if res and len(res) > 0 and res[0]:
+            print(f">> START_FROM_TAG found: #{START_FROM_TAG} at msg {res[0].id}")
+            return res[0].id
+        else:
+            print(f">> START_FROM_TAG not found in channel: #{START_FROM_TAG}")
+            return None
+    except Exception as e:
+        print(f">> START_FROM_TAG lookup failed: {e}")
+        return None
 
-# ========= Download logic =========
+def parse_start_msg_id():
+    if not START_FROM_MSG_ID:
+        return None
+    try:
+        return int(START_FROM_MSG_ID)
+    except Exception:
+        return None
+
+# ========= Per-message download =========
 SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENCY)
 
 async def download_one(client: TelegramClient, m: Message, tag_mem: TagMemory):
@@ -144,6 +170,7 @@ async def download_one(client: TelegramClient, m: Message, tag_mem: TagMemory):
 
     caption = m.message or ""
     tag = tag_mem.pick(caption)
+
     ts  = m.date.strftime("%Y%m%d_%H%M%S")
     base = f"{ts}_msg{m.id}"
 
@@ -158,7 +185,7 @@ async def download_one(client: TelegramClient, m: Message, tag_mem: TagMemory):
         with tempfile.TemporaryDirectory() as td:
             tmp_stem = Path(td) / (base + ("_" + safe_name(fname_hint) if fname_hint else ""))
 
-            # refresh the message handle (helps with grouped media)
+            # try fetching a fresh view of the msg to avoid stale refs
             try:
                 refreshed = await client.get_messages(CHANNEL_ID, ids=m.id)
                 target_msg = refreshed or m
@@ -170,15 +197,8 @@ async def download_one(client: TelegramClient, m: Message, tag_mem: TagMemory):
                 try:
                     saved_path = await client.download_media(target_msg, file=str(tmp_stem))
                     break
-                except TypeNotFoundError as e:
-                    print(f"[warn] schema hiccup on msg {m.id} (attempt {attempt+1}/5): {e}. Reconnecting…")
-                    await reconnect(client)
-                    try:
-                        refreshed = await client.get_messages(CHANNEL_ID, ids=m.id)
-                        target_msg = refreshed or m
-                    except Exception:
-                        target_msg = m
-                    await asyncio.sleep(1 + attempt)
+                except asyncio.CancelledError:
+                    raise
                 except Exception as e:
                     print(f"[warn] retry {attempt+1} on msg {m.id}: {e}")
                     await asyncio.sleep(2 + attempt * 2)
@@ -193,7 +213,6 @@ async def download_one(client: TelegramClient, m: Message, tag_mem: TagMemory):
                 return
 
             remote_path = f"{tag}/{safe_name(local_path.name)}"
-
             if b2_exists(remote_path):
                 if uid:
                     seen_ids.add(uid)
@@ -210,21 +229,9 @@ async def download_one(client: TelegramClient, m: Message, tag_mem: TagMemory):
     manifest["media_ids"] = list(seen_ids)
     save_manifest(manifest)
 
-# ========= Main (NEW → OLD) =========
+# ========= Main =========
 async def main():
-    client = TelegramClient(
-        SESSION_NAME,
-        API_ID,
-        API_HASH,
-        device_model="BackupWorker",
-        system_version="macOS 14",
-        app_version="1.0.0",
-        lang_code="en",
-        system_lang_code="en",
-        request_retries=5,
-        connection_retries=5,
-        flood_sleep_threshold=60,
-    )
+    client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
     await client.connect()
     await ensure_logged_in(client)
 
@@ -232,38 +239,43 @@ async def main():
     total = 0
     last_beat = time.time()
 
+    # Direction: NEW -> OLD (reverse=False)
+    start_id = parse_start_msg_id()
+    if start_id is None:
+        start_id = await resolve_start_from_tag_id(client)
+
     print(">> Starting backup… direction=new2old  (reverse=False)")
+    if start_id:
+        print(f">> Starting from msg id {start_id}")
 
-    # Iterate newest -> oldest. This avoids scanning through the first N ids.
-    # We only process messages that have media.
-    try:
-        async for m in client.iter_messages(
-            CHANNEL_ID,
-            limit=None,            # all
-            reverse=False,         # NEW -> OLD
-        ):
-            try:
-                await download_one(client, m, tag_mem)
-            except Exception as e:
-                print(f"[error] unhandled during msg {getattr(m,'id',None)}: {e}")
-                traceback.print_exc()
+    inflight = set()
 
-            total += 1
-            if total % 50 == 0:
-                print(f">> Processed {total} messages…")
+    async for m in client.iter_messages(
+        CHANNEL_ID,
+        limit=None,
+        reverse=False,          # new -> old
+        offset_id=start_id or 0 # 0 if None
+    ):
+        try:
+            t = asyncio.create_task(download_one(client, m, tag_mem))
+            inflight.add(t)
+            # backpressure
+            if len(inflight) >= MAX_INFLIGHT:
+                done, inflight = await asyncio.wait(inflight, return_when=asyncio.FIRST_COMPLETED)
+        except Exception as e:
+            print(f"[error] scheduling msg {getattr(m,'id', '?')}: {e}")
+            traceback.print_exc()
 
-            if time.time() - last_beat > 10:
-                print(f">> Heartbeat: total={total}, last_id={getattr(m,'id',None)}, time={time.strftime('%H:%M:%S')}")
-                last_beat = time.time()
+        total += 1
+        if time.time() - last_beat > 10:
+            print(f">> Heartbeat: total={total}, last_id={m.id}, time={time.strftime('%H:%M:%S')}")
+            last_beat = time.time()
 
-    except TypeNotFoundError as e:
-        print(f"[warn] stream schema hiccup: {e}. Reconnecting and continuing…")
-        await reconnect(client)
-        # Let the process restart (Railway will usually restart on non-zero exit),
-        # or simply end here gracefully:
-    finally:
-        await client.disconnect()
+    # drain remaining tasks
+    if inflight:
+        await asyncio.gather(*inflight, return_exceptions=True)
 
+    await client.disconnect()
     print(">> Done. Manifest saved.")
 
 if __name__ == "__main__":
